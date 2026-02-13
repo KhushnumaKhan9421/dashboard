@@ -1,0 +1,173 @@
+import boto3
+import uuid
+import json
+from datetime import datetime
+
+s3 = boto3.client('s3')
+ec2 = boto3.client('ec2')
+sns = boto3.client('sns')
+dynamodb = boto3.resource('dynamodb')
+
+TABLE_NAME = "SecurityAuditResults"
+SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:212208750396:SecurityAuditAlerts"
+
+def lambda_handler(event, context):
+
+    vulnerabilities = []
+    suggestions = []
+    score = 100
+
+    # =========================
+    # CHECK PUBLIC S3 BUCKET
+    # =========================
+    try:
+        buckets = s3.list_buckets()['Buckets']
+        for bucket in buckets:
+            name = bucket['Name']
+
+            public_detected = False
+
+            # Check Public Access Block
+            try:
+                pab = s3.get_public_access_block(Bucket=name)
+                config = pab['PublicAccessBlockConfiguration']
+
+                if not all([
+                    config['BlockPublicAcls'],
+                    config['IgnorePublicAcls'],
+                    config['BlockPublicPolicy'],
+                    config['RestrictPublicBuckets']
+                ]):
+                    public_detected = True
+                    vulnerabilities.append(f"S3 Bucket '{name}' has Block Public Access DISABLED")
+                    suggestions.append(f"Enable 'Block all public access' for bucket: {name}")
+                    score -= 20
+            except:
+                public_detected = True
+                vulnerabilities.append(f"S3 Bucket '{name}' has NO Public Access Block")
+                suggestions.append(f"Enable 'Block all public access' for bucket: {name}")
+                score -= 20
+
+            # Check ACL Public
+            try:
+                acl = s3.get_bucket_acl(Bucket=name)
+                for grant in acl['Grants']:
+                    if 'AllUsers' in str(grant):
+                        public_detected = True
+                        vulnerabilities.append(f"S3 Bucket '{name}' is PUBLIC via ACL")
+                        suggestions.append(f"Remove public ACL from bucket: {name}")
+                        score -= 30
+                        break
+            except:
+                pass
+
+            # Check Bucket Policy Public
+            try:
+                policy = s3.get_bucket_policy(Bucket=name)
+                policy_json = json.loads(policy['Policy'])
+                for stmt in policy_json['Statement']:
+                    if stmt.get('Principal') == "*" and "s3:GetObject" in stmt.get('Action', []):
+                        public_detected = True
+                        vulnerabilities.append(f"S3 Bucket '{name}' is PUBLIC via Bucket Policy")
+                        suggestions.append(f"Remove public policy from bucket: {name}")
+                        score -= 30
+                        break
+            except:
+                pass
+
+    except Exception as e:
+        print("Error checking S3:", str(e))
+
+
+    # =========================
+    # CHECK OPEN SECURITY GROUP
+    # =========================
+    try:
+        response = ec2.describe_security_groups()
+        for sg in response['SecurityGroups']:
+            for perm in sg['IpPermissions']:
+                for ip in perm.get('IpRanges', []):
+                    if ip.get('CidrIp') == '0.0.0.0/0':
+                        vulnerabilities.append(f"Security Group '{sg['GroupName']}' open to WORLD")
+                        suggestions.append(f"Restrict Security Group '{sg['GroupName']}' to trusted IP")
+                        score -= 30
+                        break
+    except Exception as e:
+        print("Error checking Security Groups:", str(e))
+
+
+    # =========================
+    # RISK LEVEL
+    # =========================
+    if score >= 80:
+        risk_level = "LOW"
+    elif score >= 50:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "HIGH"
+
+
+    # =========================
+    # FINAL STATUS
+    # =========================
+    status = "VULNERABILITY FOUND" if vulnerabilities else "SAFE"
+
+    report = f"""
+AWS SECURITY AUDIT REPORT
+-------------------------
+Time: {datetime.now()}
+Status: {status}
+Risk Score: {score}
+Risk Level: {risk_level}
+
+Issues:
+{vulnerabilities if vulnerabilities else 'No issues'}
+
+Suggestions:
+{suggestions if suggestions else 'System secure'}
+"""
+
+    print(report)
+
+
+    # =========================
+    # STORE IN DYNAMODB
+    # =========================
+    try:
+        table = dynamodb.Table(TABLE_NAME)
+        table.put_item(
+            Item={
+                'id': str(uuid.uuid4()),
+                'timestamp': str(datetime.now()),
+                'status': status,
+                'score': score,
+                'risk_level': risk_level,
+                'issues': str(vulnerabilities),
+                'suggestions': str(suggestions)
+            }
+        )
+    except Exception as e:
+        print("DynamoDB error:", str(e))
+
+
+    # =========================
+    # SEND SNS ALERT
+    # =========================
+    if vulnerabilities:
+        try:
+            sns.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Message=report,
+                Subject=f"AWS Security Alert - {risk_level} Risk"
+            )
+        except Exception as e:
+            print("SNS error:", str(e))
+
+
+    return {
+        "Status": status,
+        "Risk Score": score,
+        "Risk Level": risk_level,
+        "Issues": vulnerabilities,
+        "Suggestions": suggestions
+    }
